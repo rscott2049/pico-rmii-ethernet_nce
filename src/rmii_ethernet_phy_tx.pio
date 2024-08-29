@@ -1,0 +1,78 @@
+/*
+ * Copyright (c) Rob Scott, with portions copyrighted as below
+ *
+ * Copyright (c) 2021 Sandeep Mistry
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+.program rmii_ethernet_phy_tx_data
+
+.side_set 1
+.wrap_target
+
+    // This program runs at half a cycle per clock (1HC/clock) to handle 
+    // the data loop, so every delay needs to be doubled
+
+    // Wait for data to transmit. Adds extra byte to IPG.
+    set pins, 0b00  side 0  [5]  // 6 HC, 6 bits. 
+    pull block      side 0       // 1 HC, 1 bits - Wait for new data
+    wait 1 pin 0    side 0       // 1 HC, 1 bits, finished byte
+
+// Write 0b01 for 31 cycles (preamble start)
+header_start:
+    set pins, 0b01  side 1  [15] // 16 HC
+    nop             side 1  [15] // 16 HC
+    set X, 9        side 1  [15] // 16 HC, prepare for part of IPG: 10 bytes
+    nop             side 1  [13] // 14 HC
+                                 // \---> 62HC = 31 cycles
+
+// Write 0b11 for 1 cycle (preamble finish)
+ready_bit:
+    set pins, 0b11  side 1  [ 1] // 2 HC = 1 cycle
+
+// Write the data, 2 bits at a time
+loop:
+    out pins, 2     side 1       // 1 HC
+    jmp !osre, loop side 1       // 1 HC
+                                 // \---> 2HC = 1 cycle
+
+// Do IPG of 12 bytes: one here, 10 in the ipg loop below, one at top of loop
+// Note that the set instruction isn't strictly necessary - DV deassert should
+// put idle on the wire
+    set pins, 0b00  side 0 [7]  // 8 HC, 8 bits. 
+ipg:
+    jmp X--, ipg    side 0 [7]  // 8 HC, one byte per loop
+
+.wrap
+
+% c-sdk {
+
+static inline void rmii_ethernet_phy_tx_init(PIO pio, uint sm, uint offset, uint base_pin, uint retclk_pin, float div) {
+    // Set the TX_[0,1,EN] in PIO mode
+    // Note: do not set RETCLK pin here, it's used as a clock output and only as an input in the PIO program
+    pio_gpio_init(pio, base_pin);
+    pio_gpio_init(pio, base_pin + 1);
+    pio_gpio_init(pio, base_pin + 2);
+
+    // Set RETCLK pin as input
+    pio_sm_set_pins_with_mask(pio, sm, 1<<retclk_pin, 0<<retclk_pin);
+    // Set TX_[0,1,EN] as output
+    pio_sm_set_consecutive_pindirs(pio, sm, base_pin, 3, true);
+
+    pio_sm_config c = rmii_ethernet_phy_tx_data_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, retclk_pin);
+    sm_config_set_out_pins(&c, base_pin, 2);
+    sm_config_set_set_pins(&c, base_pin, 2);
+    sm_config_set_sideset_pins(&c, base_pin + 2);
+
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_out_shift(&c, true, true, 8);
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

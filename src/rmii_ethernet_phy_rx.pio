@@ -1,0 +1,48 @@
+/*
+ * Copyright (c) Rob Scott, with portions copyrighted as below
+ *
+ * Copyright (c) 2021 Sandeep Mistry
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+.program rmii_ethernet_phy_rx_data
+.wrap_target
+   irq set 0          ; Signal end of active packet
+start:
+    wait 1 pin 2      ; Wait for CR_DV assertion
+    wait 1 pin 0      ; Wait for RX<0> to assert, signalling preamble start
+    wait 1 pin 1 [2]  ; Wait for Start of Frame Delimiter, align to sample clk
+sample:
+    in pins, 2        ; accumulate di-bits
+    jmp PIN, sample   ; as long as CRS_DV is asserted
+.wrap
+
+% c-sdk {
+
+static inline void rmii_ethernet_phy_rx_init(PIO pio, uint sm, uint offset, uint pin, float div) {
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 3, false);
+
+    pio_sm_config c = rmii_ethernet_phy_rx_data_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+
+    // Set jump pin to CR_DV
+    sm_config_set_jmp_pin(&c, pin+2);
+
+    pio_gpio_init(pio, pin);
+    pio_gpio_init(pio, pin + 1);
+    pio_gpio_init(pio, pin + 2);
+    
+    // Disable synchronizers - remove two clock delays...
+    //hw_clear_bits(&pio->input_sync_bypass, 0x7u << pin);
+
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_in_shift(&c, true, true, 8);
+
+    // Runs at the same rate as TX engine
+    sm_config_set_clkdiv(&c, div);
+    
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
