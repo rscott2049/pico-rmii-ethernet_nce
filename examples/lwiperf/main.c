@@ -35,8 +35,6 @@ void __not_in_flash_func(netif_link_callback)(struct netif *netif) {
     // Send reset command
     netif_rmii_ethernet_mdio_write(phy_address, LAN8720A_BASIC_CONTROL_REG,
 				   0x8000);
-    // Tell LWIP link is down
-    //netif_set_link_down(netif);
   }
 
 }
@@ -90,32 +88,36 @@ int __not_in_flash_func(main)() {
   *addr = PADS_BANK0_VOLTAGE_SELECT_VALUE_1V8 << PADS_BANK0_VOLTAGE_SELECT_LSB;
 #endif
 
-  // Configure clock output on retclk pin to be 50 MHz
-  float clk_50_div = clock_get_hz(clk_sys)/50000000.0;
-  clock_gpio_init(netif_config.retclk_pin, CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS, clk_50_div);
-
-  // Enable 50% duty cycle for odd divisors
+  // Find which clk is connected to the retclk pin
   uint gpclk = 0;
   uint gpio = netif_config.retclk_pin;
   if      (gpio == 21) gpclk = clk_gpout0;
   else if (gpio == 23) gpclk = clk_gpout1;
   else if (gpio == 24) gpclk = clk_gpout2;
   else if (gpio == 25) gpclk = clk_gpout3;
- 
+
+  // Push clock phase out when operating at lower speeds.
+  // Must be done before clock initialized, according to the datasheet
+  // Chicken entrails...
+  if (target_clk == 150000000) {
+    clocks_hw->clk[gpclk].ctrl = 0x2 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  } else if (target_clk == 100000000) {
+    clocks_hw->clk[gpclk].ctrl = 0x1 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  } else {
+    clocks_hw->clk[gpclk].ctrl = 0x0 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  }
+
+  // Configure clock output on retclk pin to be 50 MHz
+  float clk_50_div = clock_get_hz(clk_sys)/50000000.0;
+  clock_gpio_init(netif_config.retclk_pin, CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS, clk_50_div);
+
+  // Enable 50% duty cycle for odd divisors
   clocks_hw->clk[gpclk].ctrl |= CLOCKS_CLK_GPOUT0_CTRL_DC50_BITS;
 
   // Initialize stdio after the clock change
   sleep_ms(1);
   stdio_init_all();
   sleep_ms(3000);
-
-#if 0 
-  uint32_t count = 0;
-  while(1) {
-    printf("%d hello world\n", count++);
-    sleep_ms(1000);
-  }
-#endif
 
   printf("&&& pico rmii ethernet - iperf\n");
 
@@ -142,6 +144,7 @@ int __not_in_flash_func(main)() {
   // This allows core 0 do other things :)
   multicore_launch_core1(netif_rmii_ethernet_loop);
 
+  uint32_t count = 0;
   while (1) {
     tight_loop_contents();
   }

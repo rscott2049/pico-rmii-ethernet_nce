@@ -39,6 +39,7 @@
 
 // Need to hold at least two full Ethernet frames
 #define RX_BUF_SIZE_POW 12
+//#define RX_BUF_SIZE_POW 15
 #define RX_BUF_SIZE (1 << RX_BUF_SIZE_POW)
 #define RX_BUF_MASK (RX_BUF_SIZE - 1)
 
@@ -62,12 +63,11 @@ typedef struct {
 // Written by ISR, read by packet processing routine
 static volatile pkt_ptr_t rx_pkt_ptr[RX_NUM_PTR];
 static volatile uint32_t rx_curr_pkt_ptr = 0;
-static volatile uint32_t max_pkt = 0;
 
-// Used only by ISR
+// Start of current packet. Used only by ISR
 static uint32_t rx_addr = 0;
 
-// Used only by packet processing routine
+// Used by ethernet_poll()
 static uint32_t rx_prev_pkt_ptr = 0;
 
 // Max Ethernet frame size is:
@@ -78,8 +78,10 @@ static uint32_t rx_prev_pkt_ptr = 0;
 // Seems to work for LWIP with just one frame of buffering - still allows
 // overlap of transmit and filling of transmit buffer
 // Specify size in bytes, so 4096 is 2^12
-#define TX_BUF_SIZE_POW 12
 //#define TX_BUF_SIZE_POW 11
+#define TX_BUF_SIZE_POW 12
+//#define TX_BUF_SIZE_POW 13
+//#define TX_BUF_SIZE_POW 14
 #define TX_BUF_SIZE (1 << TX_BUF_SIZE_POW)
 #define TX_BUF_MASK (TX_BUF_SIZE - 1)
 
@@ -92,11 +94,15 @@ static volatile uint8_t tx_ring[TX_BUF_SIZE] __attribute__((aligned (TX_BUF_SIZE
 // i.e. 4096/64 = 64 * 4 bytes, or 6 + 2
 // LWIP doesn't seem to use that many, so 16 is sufficient (verified by
 // sending ping packets with -s 10400).
-#define TX_NUM_PTR_POW (6 + 2)
-//#define TX_NUM_PTR_POW (4 + 2)
+//#define TX_NUM_PTR_POW (10 + 2)
+//#define TX_NUM_PTR_POW (6 + 2)
+#define TX_NUM_PTR_POW (4 + 2)
 #define TX_NUM_PTR_BYTES (1 << TX_NUM_PTR_POW)
 #define TX_NUM_PTR (1 << (TX_NUM_PTR_POW - 2))
 #define TX_NUM_MASK (TX_NUM_PTR - 1)
+
+// Enable using the DMA sniffer for CRC calculations
+#define USE_DMA_CRC
 
 // Holds transmit packet length
 // Must be aligned to be used as a ring buffer
@@ -104,7 +110,11 @@ static volatile uint32_t tx_pkt_ptr[TX_NUM_PTR] __attribute__((aligned (TX_NUM_P
 
 volatile uint32_t tx_addr = 0;
 volatile uint32_t tx_curr_pkt_ptr = 0;
+volatile uint32_t tx_exp_pkt_ptr = 0;
+
 uint32_t tx_prev_pkt_ptr = 0;
+
+volatile uint32_t bad_crc = 0;
 
 static struct netif *rmii_eth_netif;
 static struct netif_rmii_ethernet_config rmii_eth_netif_config = NETIF_RMII_ETHERNET_DEFAULT_CONFIG();
@@ -124,6 +134,11 @@ static dma_channel_config ipg_dma_channel_config;
 static dma_channel_config tx_dma_channel_config;
 static dma_channel_config tx_chain_channel_config;
 
+static int pbuf_chan;
+static dma_channel_config pbuf_rx_channel_config;
+static dma_channel_config pbuf_tx_channel_config;
+static dma_channel_config pbuf_tx_no_inc_channel_config;
+
 // Reload RX DMA engine after this many bytes 
 static uint32_t rx_packet_size = RX_BUF_SIZE;
 
@@ -134,6 +149,9 @@ static volatile uint32_t ipg_tx_rd_addr;
 int phy_address;
 
 static const uint32_t ethernet_polynomial_le = 0xedb88320U;
+
+// Right shift CRC check value, complemented
+#define CRC_CHECK_VALUE 0xdebb20e3
 
 #ifndef USE_CPU_CRC
 static uint32_t crc32Lookup[256] =
@@ -172,6 +190,39 @@ static uint32_t crc32Lookup[256] =
 };
 #endif
 
+void dump_dma_cfg(uint32_t cfg, uint32_t chan) {
+  uint32_t chain_bits =  (cfg & DMA_CH0_CTRL_TRIG_CHAIN_TO_BITS) >>
+    DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB;
+
+  if (chain_bits != chan) {
+    printf("chain to: %02x\n", chain_bits);
+  } else {
+    printf("no chain\n");
+  }
+}
+
+void dump_dma_reg(char* type, uint32_t chan) {
+
+  printf("%s DMA chan: %d\n", type, chan);
+  printf("raddr: %08x %08x\n", (uint32_t)&dma_hw->ch[chan].read_addr,
+	 dma_hw->ch[chan].read_addr);
+  printf("waddr: %08x %08x\n", (uint32_t)&dma_hw->ch[chan].write_addr,
+	 dma_hw->ch[chan].write_addr);
+  printf("count: %08x %08x\n", (uint32_t)&dma_hw->ch[chan].transfer_count,
+	 dma_hw->ch[chan].transfer_count);
+
+  printf("next : %08x %08x\n", (uint32_t)&dma_debug_hw->ch[chan].dbg_tcr,
+	 dma_debug_hw->ch[chan].dbg_tcr);
+
+  printf("ctl:   %08x %08x ", (uint32_t)&dma_hw->ch[chan].ctrl_trig,
+	 dma_hw->ch[chan].ctrl_trig);
+
+  dump_dma_cfg(dma_hw->ch[chan].ctrl_trig, chan);
+
+  //print_dma_ctrl(chan);
+
+}
+
 // Fetch data from ring buffer, calculate CRC, write data to destination pbuf
 // Return length (valid) or zero (invalid CRC)
 static uint __not_in_flash_func(ethernet_frame_length_pbuf)(volatile uint8_t *data, 
@@ -191,13 +242,16 @@ static uint __not_in_flash_func(ethernet_frame_length_pbuf)(volatile uint8_t *da
     uint8_t curr_data;
     uint32_t lsb;
     uint32_t offset;
-    uint8_t *orig_ptr;
     uint8_t *wr_ptr;
 
+
+#ifdef USE_DMA_CRC    
+    dma_channel_wait_for_finish_blocking(pbuf_chan);
+    dma_hw->sniff_data = 0xffffffff;
+#endif
     // This is from LWIP pbuf.c, pbuf_take(...)
     for (p = buf; total_copy_len != 0; p = p->next) {
       wr_ptr = (uint8_t *)p->payload;
-      orig_ptr = (uint8_t *)p->payload;
 
       buf_copy_len = total_copy_len;
       if (buf_copy_len > p->len) {
@@ -205,6 +259,7 @@ static uint __not_in_flash_func(ethernet_frame_length_pbuf)(volatile uint8_t *da
 	buf_copy_len = p->len;
       }
 
+#ifndef USE_DMA_CRC
       // Calculate CRC over payload
       for (i = 0; i < buf_copy_len; i++) {
 	// Get data from ring buffer
@@ -216,7 +271,13 @@ static uint __not_in_flash_func(ethernet_frame_length_pbuf)(volatile uint8_t *da
 	// Save data
 	*wr_ptr++ = curr_data;
 
-	if (total_copy_len > 4) {
+#define USE_CRC_CHECK_VALUE
+#ifndef USE_CRC_CHECK_VALUE
+#define LAST_CRC_BYTE 4
+#else
+#define LAST_CRC_BYTE 0
+#endif
+	if (total_copy_len > LAST_CRC_BYTE) {
 	  // Calculate CRC
 #ifdef USE_CPU_CRC
 	  crc ^= curr_data;
@@ -233,21 +294,49 @@ static uint __not_in_flash_func(ethernet_frame_length_pbuf)(volatile uint8_t *da
 	  // Save CRC
 	  pkt_crc |= curr_data << ((4 - total_copy_len) * 8);
 	}
+
 	total_copy_len--;
       }
+
+#else // #ifndef USE_DMA_CRC
+#define USE_CRC_CHECK_VALUE
+      // Setup DMA to copy this portion of the pbuf
+      dma_channel_wait_for_finish_blocking(pbuf_chan);
+      dma_channel_hw_addr(pbuf_chan)->read_addr = (uint32_t)&(data[addr]);
+      dma_channel_hw_addr(pbuf_chan)->write_addr = (uint32_t)(wr_ptr);
+      dma_channel_hw_addr(pbuf_chan)->transfer_count = buf_copy_len;
+      // Fire it off
+      dma_channel_set_config(pbuf_chan, &pbuf_rx_channel_config, true);
+
+      addr = (addr + buf_copy_len) & RX_BUF_MASK;
+      total_copy_len -= buf_copy_len;
+#endif
     }
 
+#ifdef USE_DMA_CRC
+    dma_channel_wait_for_finish_blocking(pbuf_chan);
+    crc = dma_hw->sniff_data;
+#endif
+
+
+#ifndef USE_CRC_CHECK_VALUE
     inverted_crc = ~crc;
 
     // Bad packet, return 0 for error
     if (pkt_crc != inverted_crc) {
       len = 0;
     }
+#else
+    // Compare CRC against check value
+    // See https://en.wikipedia.org/wiki/Ethernet_frame#Frame_check_sequence
+    if (crc != CRC_CHECK_VALUE) len = 0;
+#endif
 
     return len;
 }
 
 // Copy packet data to ring buffer, adding pkt len, and CRC, for transmission
+// Assumes space availability check done before calling this function
 // Returns final length, including pkt len and CRC
 static uint __not_in_flash_func(ethernet_frame_copy_ring_pbuf)(volatile uint8_t *data, 
 					  struct pbuf *p,
@@ -258,13 +347,20 @@ static uint __not_in_flash_func(ethernet_frame_copy_ring_pbuf)(volatile uint8_t 
     uint8_t buf_dat;
     uint32_t tot_len = 0;
     int j;
-
-#ifdef USE_CPU_CRC
     int i;
     uint32_t lsb;
+    uint8_t offset;
+    int orig_addr = addr;
+    uint8_t *orig_payload;
+
+#ifdef USE_DMA_CRC    
+    dma_channel_wait_for_finish_blocking(pbuf_chan);
+    dma_hw->sniff_data = 0xffffffff;
+#endif
 
     // Get the payload from lwip, generating CRC along the way
     for (struct pbuf *q = p; q != NULL; q = q->next) {
+#ifndef USE_DMA_CRC
       for (j = 0; j < q->len; j++) {
 	buf_dat = *(uint8_t *)(q->payload++);
 	data[addr] = buf_dat;
@@ -274,15 +370,35 @@ static uint __not_in_flash_func(ethernet_frame_copy_ring_pbuf)(volatile uint8_t 
 	addr = (addr + 1) & TX_BUF_MASK;
 
 	// Accumulate CRC
+#ifdef USE_CPU_CRC
 	crc ^= buf_dat;
 	for (i = 0; i < 8; i++) {
 	  lsb = crc & 1;
 	  crc >>= 1;
 	  if (lsb) crc ^= ethernet_polynomial_le;
 	}
+#else
+	// Accumulate CRC
+	offset = (crc & 0xff) ^ buf_dat;
+	crc = (crc >> 8) ^ crc32Lookup[offset];
+#endif
       }
-    }
-    
+
+#else //#ifndef USE_DMA_CRC      
+      // Setup DMA to copy this portion of the pbuf
+      dma_channel_wait_for_finish_blocking(pbuf_chan);
+      dma_channel_hw_addr(pbuf_chan)->read_addr = (uint32_t)(q->payload);
+      dma_channel_hw_addr(pbuf_chan)->write_addr = (uint32_t)(&data[addr]);
+      dma_channel_hw_addr(pbuf_chan)->transfer_count = q->len;
+      dma_channel_set_config(pbuf_chan, &pbuf_tx_channel_config, true);
+
+      // Wrap address around ring buffer
+      addr = (addr + q->len) & TX_BUF_MASK;
+      tot_len += q->len;
+#endif
+    }    
+
+#ifndef USE_DMA_CRC
     // Make sure we have enough bytes to meet minimum packet size, minus CRC
     while (tot_len < 60) {
       buf_dat = 0; // padding byte
@@ -293,48 +409,40 @@ static uint __not_in_flash_func(ethernet_frame_copy_ring_pbuf)(volatile uint8_t 
       addr = (addr + 1) & TX_BUF_MASK;
 
       // Accumulate CRC
+#ifdef USE_CPU_CRC
       crc ^= buf_dat;
       for (i = 0; i < 8; i++) {
 	lsb = crc & 1;
 	crc >>= 1;
 	if (lsb) crc ^= ethernet_polynomial_le;
       }
-    }
-
 #else
-    uint8_t offset;
-
-    // Get the payload from lwip, generating CRC along the way
-    for (struct pbuf *q = p; q != NULL; q = q->next) {
-      for (j = 0; j < q->len; j++) {
-	buf_dat = *(uint8_t *)(q->payload++);
-	data[addr] = buf_dat;
-	tot_len++;
-
-	// Wrap address around ring buffer
-	addr = (addr + 1) & TX_BUF_MASK;
-
-	// Accumulate CRC
-	offset = (crc & 0xff) ^ buf_dat;
-	crc = (crc >> 8) ^ crc32Lookup[offset];
-      }
-    }
-
-    // Make sure we have enough bytes to meet minimum packet size, minus CRC
-    while (tot_len < 60) {
-      buf_dat = 0; // padding byte
-      data[addr] = buf_dat;
-      tot_len++;
-
-      // Wrap address around ring buffer
-      addr = (addr + 1) & TX_BUF_MASK;
-
-      // Accumulate CRC
       offset = (crc & 0xff) ^ buf_dat;
       crc = (crc >> 8) ^ crc32Lookup[offset];
-    }
 #endif
-      
+    }
+
+#else //#ifndef USE_DMA_CRC
+    if (tot_len < 60) {
+      uint32_t zero = 0;
+      uint32_t remainder = 60 - tot_len;
+
+      dma_channel_wait_for_finish_blocking(pbuf_chan);
+      dma_channel_hw_addr(pbuf_chan)->read_addr = (uint32_t)(&zero);
+      dma_channel_hw_addr(pbuf_chan)->transfer_count = remainder;
+
+      // Fire off buffer fill
+      dma_channel_set_config(pbuf_chan, &pbuf_tx_no_inc_channel_config, true);
+
+      // Wrap address around ring buffer
+      addr = (addr + remainder) & TX_BUF_MASK;
+      tot_len += remainder;
+    }
+
+    dma_channel_wait_for_finish_blocking(pbuf_chan);
+    crc = dma_hw->sniff_data;
+#endif
+
     // Insert CRC into packet
     inverted_crc = ~crc;
 
@@ -397,7 +505,7 @@ static void state_alpha(enum md_pin_states state) {
 }
 #endif
 
-// Interrupt service routine, called on falling edge of MDC
+// Interrupt service routine, called on falling edge of MD clock 
 // Pushes command bits during non MD_DATA states, read/writes during.
 // Note: MSB data is sent first
 
@@ -607,7 +715,6 @@ uint32_t __not_in_flash_func(netif_rmii_ethernet_mdio_read_nb)(uint addr, uint r
 // Blocking MDIO read
 uint16_t __not_in_flash_func(netif_rmii_ethernet_mdio_read)(uint addr, uint reg)
 {
-
     // Kick off state machine, wait for end
     md_sm_start(addr, reg, 0, MD_READ, 1);
 
@@ -638,34 +745,30 @@ void __not_in_flash_func(netif_rmii_ethernet_mdio_write)(uint addr, uint reg, ui
 static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif, struct pbuf *p)
 {
     uint32_t curr_cmd;
+    uint32_t tx_next_pkt_ptr;
 
-    // Compare Tx packet address saved at last IPG against current
-    uint32_t curr_rd_addr = dma_hw->ch[tx_dma_chan].read_addr;
+    // Test to see if there's space in the buffer for the packet
+    // Pbuf length does not include CRC bytes
+    uint32_t plen = p->tot_len + 4;
+
+    // Nor does it pad to minimum Ethernet frame size
+    if (plen < 64) plen = 64;
+
+    // Make Tx read addr into ring buffer index
+    uint32_t curr_rd = (dma_hw->ch[tx_dma_chan].read_addr) & TX_BUF_MASK;
+      
+    // Get current ring buffer write address index
     uint32_t curr_wr = tx_addr;
 
-    // Test to see if we need to wait for space to be available or not
-    // If tx current transmit and last transmit addresses are equal, we're idle
-    // (at least at this moment in time!) so we have at least one pkt space avail
-    if (ipg_tx_rd_addr != curr_rd_addr) {
-     
-      // Pbuf length does not include CRC bytes
-      uint32_t plen = p->tot_len + 4;
+    // Calculate free space available
+    uint32_t tx_buf_wrap = (curr_rd ^ curr_wr) & TX_BUF_MASK;
+    uint32_t tx_free = (TX_BUF_SIZE -
+			(tx_buf_wrap ? ((curr_rd - curr_wr) & TX_BUF_MASK) :
+			 (curr_wr - curr_rd)));
 
-      // Nor does it pad to minimum Ethernet frame size
-      if (plen < 64) plen = 64;
-
-      // Make Tx read addr into ring buffer index
-      uint32_t curr_rd = curr_rd_addr & TX_BUF_MASK;
-      
-      // Calculate free space available
-      uint32_t tx_buf_wrap = (curr_rd ^ curr_wr) & (1 << (TX_BUF_SIZE_POW-1));
-      uint32_t tx_free = (TX_BUF_SIZE -
-			  (tx_buf_wrap ? ((curr_rd - curr_wr) & TX_BUF_MASK) :
-			   (curr_wr - curr_rd)));
-
-      // Wait if we don't have enough free space
-      if (plen > tx_free) {
-      }
+    // Wait for current packet to end, if we don't have enough free space
+    if (plen > tx_free) {
+      dma_channel_wait_for_finish_blocking(tx_dma_chan);
     }
 
     // Push frame into ring buffer
@@ -673,7 +776,6 @@ static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif
 
     // Bump frame ring buffer addr
     tx_addr = (tx_addr + len) & TX_BUF_MASK;
-
 
     // Handle idle case and active case seperately, even if there's
     // some redundancy
@@ -684,28 +786,24 @@ static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif
     // Active:
     //   Write into command ring, update write pointer
 
-
     if (!dma_channel_is_busy(tx_dma_chan) &&
 	!dma_channel_is_busy(ipg_dma_chan)) {
       // Update tx current packet pointer from command pointer
       // Command pointer will be advanced to EOC NULL when at end of cmds
       // one beyond last tx_curr_ptk_ptr
 
-      // Update only if we're really idle: not transmitting, nor in IPG
+      // Update ptk ptr only if we're really idle: not transmitting, nor in IPG
       curr_cmd = (dma_channel_hw_addr(tx_chain_chan)->read_addr);
       tx_curr_pkt_ptr = (curr_cmd >> 2) & TX_NUM_MASK;
 
       // Generate next packet pointer
-      uint32_t tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
+      tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
 
       // Put end of commands (EOC) into command ring, after new command
       tx_pkt_ptr[tx_next_pkt_ptr] = 0;
 
       // Write new command into cmd ring buffer
       tx_pkt_ptr[tx_curr_pkt_ptr] = len;
-
-      // Save command address for DMA
-      uint32_t tx_pkt_addr = (uint32_t)&(tx_pkt_ptr[tx_curr_pkt_ptr]);
 
       // Bump command ring buffer address
       tx_curr_pkt_ptr = tx_next_pkt_ptr;
@@ -716,10 +814,7 @@ static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif
     } else {
       // DMA active
       // Generate next packet pointer
-      uint32_t tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
-
-      curr_cmd = (dma_channel_hw_addr(tx_chain_chan)->read_addr);
-      curr_cmd = (curr_cmd >> 2) & TX_NUM_MASK;
+      tx_next_pkt_ptr = (tx_curr_pkt_ptr + 1) & TX_NUM_MASK;
 
       // Put end of commands (EOC) into command ring, after new command
       // Do this now, in case data channel DMA triggers while we're 
@@ -746,9 +841,10 @@ static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif
 	  }
 	}
       }
+
       // Bump command ring buffer address
       tx_curr_pkt_ptr = tx_next_pkt_ptr;
-    } 
+    }
 
     return ERR_OK;
 }
@@ -756,6 +852,8 @@ static err_t __not_in_flash_func(netif_rmii_ethernet_output)(struct netif *netif
 
 // Do end of received packet processing
 // We have at least 960ns (IPG) before next packet
+//static uint rx_tot_len = 0;
+
 static void __not_in_flash_func(netif_rmii_ethernet_eof_isr)(){
   uint32_t prev_rx_addr;
   uint32_t rx_packet_byte_count;
@@ -881,8 +979,7 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
     // Write to single address, don't increment write address
     channel_config_set_write_increment(&rx_chain_channel_config, false);
 
-    dma_channel_configure(
-			  rx_chain_chan, &rx_chain_channel_config,
+    dma_channel_configure(rx_chain_chan, &rx_chain_channel_config,
 			  &dma_hw->ch[rx_dma_chan].al1_transfer_count_trig,
 			  &rx_packet_size, // Contains default RX receive size
 			  1,
@@ -977,8 +1074,7 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
     // Write to single address, don't increment write address
     channel_config_set_write_increment(&tx_chain_channel_config, false);
 
-    dma_channel_configure(
-			  tx_chain_chan, &tx_chain_channel_config,
+    dma_channel_configure(tx_chain_chan, &tx_chain_channel_config,
 			  &dma_hw->ch[tx_dma_chan].al1_transfer_count_trig,
 			  &tx_pkt_ptr[0],
 			  1, // Will be over-written by packet output routine
@@ -986,6 +1082,59 @@ static err_t netif_rmii_ethernet_low_init(struct netif *netif) {
 			  );
 
     
+#ifdef USE_DMA_CRC
+    pbuf_chan = dma_claim_unused_channel(true);
+    dma_channel_abort(pbuf_chan);
+    dma_channel_hw_addr(pbuf_chan)->al1_ctrl = 0;
+
+    // Get default config for pbuf copy DMA channel
+    // Defaults: 32 bit xfer, unpaced, no write inc, read inc, no chain
+    pbuf_rx_channel_config = dma_channel_get_default_config(pbuf_chan);
+    
+    // Read from ring address, increment read address
+    channel_config_set_read_increment(&pbuf_rx_channel_config, true);
+
+    // Wrap read address on ring size byte boundary
+    channel_config_set_ring(&pbuf_rx_channel_config, false, RX_BUF_SIZE_POW);
+
+    // Write to buffer, increment write address
+    channel_config_set_write_increment(&pbuf_rx_channel_config, true);
+
+    // Eight bit transfers
+    channel_config_set_transfer_data_size(&pbuf_rx_channel_config, DMA_SIZE_8);
+
+    // Select this channel for sniffing
+    channel_config_set_sniff_enable(&pbuf_rx_channel_config, true);
+
+    // Enable the DMA sniffer to calculate Ethernet CRC
+    dma_sniffer_enable(pbuf_chan, 0x1, true);
+    dma_sniffer_set_output_reverse_enabled(true);
+
+    // Get default config for pbuf copy DMA channel
+    // Defaults: 32 bit xfer, unpaced, no write inc, read inc, no chain
+    pbuf_tx_channel_config = dma_channel_get_default_config(pbuf_chan);
+    
+    // Read from buffer address, increment read address
+    channel_config_set_read_increment(&pbuf_tx_channel_config, true);
+
+    // Write to ring buffer, increment write address
+    channel_config_set_write_increment(&pbuf_tx_channel_config, true);
+
+    // Wrap write address on ring size byte boundary
+    channel_config_set_ring(&pbuf_tx_channel_config, true, TX_BUF_SIZE_POW);
+
+    // Eight bit transfers
+    channel_config_set_transfer_data_size(&pbuf_tx_channel_config, DMA_SIZE_8);
+
+    // Select this channel for sniffing
+    channel_config_set_sniff_enable(&pbuf_tx_channel_config, true);
+
+    // Make a no-inc read version, for padding tx buffers
+    pbuf_tx_no_inc_channel_config = pbuf_tx_channel_config;
+    channel_config_set_read_increment(&pbuf_tx_no_inc_channel_config, false);
+
+#endif
+
     // Configure the RMII TX state machine
     float div = (float)clock_get_hz(clk_sys)/100000000.0f;
     rmii_ethernet_phy_tx_init(PICO_RMII_ETHERNET_PIO,
@@ -1108,11 +1257,12 @@ err_t netif_rmii_ethernet_init(struct netif *netif, struct netif_rmii_ethernet_c
 
 }
 
+
 void __not_in_flash_func(netif_rmii_ethernet_poll)() {
-    uint32_t rx_packet_count = 0;
+    uint32_t rx_crc_count;
+    uint32_t rx_packet_count;
     uint32_t rx_packet_byte_count = rx_pkt_ptr[rx_prev_pkt_ptr].pkt_len;
     uint32_t rx_packet_addr = rx_pkt_ptr[rx_prev_pkt_ptr].pkt_addr;
-    uint32_t rx_crc_count;
 
     // Use non-blocking MDIO read to get link status
     uint32_t deferred_read = netif_rmii_ethernet_mdio_read_nb(phy_address, 1);
@@ -1133,6 +1283,7 @@ void __not_in_flash_func(netif_rmii_ethernet_poll)() {
     // Read curr pkt ptr once, to avoid ISR updating while we're using it
     uint32_t safe_rx_curr_pkt_ptr = rx_curr_pkt_ptr;
     
+    // Deal with pointer wrap
     if (safe_rx_curr_pkt_ptr < rx_prev_pkt_ptr) {
       rx_packet_count = (RX_NUM_PTR + safe_rx_curr_pkt_ptr) - rx_prev_pkt_ptr;
     } else {
@@ -1151,15 +1302,24 @@ void __not_in_flash_func(netif_rmii_ethernet_poll)() {
       
       if (rx_packet_byte_count > 63) {
 	struct pbuf* p = pbuf_alloc(PBUF_RAW, rx_packet_byte_count, PBUF_POOL);
+
 	// Push packet from ring buffer into LWIP pbuf
-	rx_crc_count = ethernet_frame_length_pbuf(rx_ring,
-						  p,
-						  rx_packet_byte_count,
-						  rx_packet_addr);
+	uint32_t rx_len = ethernet_frame_length_pbuf(rx_ring,
+						     p,
+						     rx_packet_byte_count,
+						     rx_packet_addr);
 
 	if (rmii_eth_netif->input(p, rmii_eth_netif) != ERR_OK) {
 	  pbuf_free(p);
 	}
+
+#ifdef USE_DMA_CRC
+	// Only do this when we have DMA CRC checking, otherwise perf drops
+	if (rx_len == 0) {
+	  //printf("*");
+	  pbuf_free(p);
+	}
+#endif
       }
     }
 

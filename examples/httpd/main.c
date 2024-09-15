@@ -38,11 +38,11 @@ void netif_link_callback(struct netif *netif) {
   }
 }
 
-void netif_status_callback(struct netif *netif) {
+void __not_in_flash_func(netif_status_callback)(struct netif *netif) {
   printf("netif status changed %s\n", ip4addr_ntoa(netif_ip4_addr(netif)));
 }
 
-int main() {
+int __not_in_flash_func(main)() {
   // LWIP network interface
   struct netif netif;
 
@@ -82,19 +82,29 @@ int main() {
   *addr = PADS_BANK0_VOLTAGE_SELECT_VALUE_1V8 << PADS_BANK0_VOLTAGE_SELECT_LSB;
 #endif
 
-
-  // Configure clock output on retclk pin to be 50 MHz
-  float clk_50_div = clock_get_hz(clk_sys)/50000000;
-  clock_gpio_init(netif_config.retclk_pin, CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS, clk_50_div);
-
-  // Generate clk index from GPIO pin number
+  // Find which clk is connected to the retclk pin
   uint gpclk = 0;
   uint gpio = netif_config.retclk_pin;
   if      (gpio == 21) gpclk = clk_gpout0;
   else if (gpio == 23) gpclk = clk_gpout1;
   else if (gpio == 24) gpclk = clk_gpout2;
   else if (gpio == 25) gpclk = clk_gpout3;
- 
+
+  // Push clock phase out when operating at lower speeds.
+  // Must be done before clock initialized, according to the datasheet
+  // Chicken entrails...
+  if (target_clk == 150000000) {
+    clocks_hw->clk[gpclk].ctrl = 0x2 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  } else if (target_clk == 100000000) {
+    clocks_hw->clk[gpclk].ctrl = 0x1 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  } else {
+    clocks_hw->clk[gpclk].ctrl = 0x0 << CLOCKS_CLK_GPOUT0_CTRL_PHASE_LSB;
+  }
+
+  // Configure clock output on retclk pin to be 50 MHz
+  float clk_50_div = clock_get_hz(clk_sys)/50000000.0;
+  clock_gpio_init(netif_config.retclk_pin, CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS, clk_50_div);
+
   // Enable 50% duty cycle for odd divisors
   clocks_hw->clk[gpclk].ctrl |= CLOCKS_CLK_GPOUT0_CTRL_DC50_BITS;
 
