@@ -26,10 +26,13 @@ with system clock speed, and the memory region the executable is placed:
 | Sys Clk | Iperf CPU/SRAM | Iperf CPU/flash | Iperf DMA/SRAM | Iperf DMA/flash |
 | :---:   |     :---:      |     :---:       |   :---:        |     :---:       |
 | MHz     | Mbit/sec       | Mbit/sec        |  Mbit/sec      | Mbit/sec        |
-| 150     | 11.6           |  2.9            | 94.9           | 70.1            |
+| 150     | 11.6           |  2.9            | 94.9           | 94.9 *            |
 | 200     | 65.4           | 31.4            | 94.9           | 94.9            |
 | 250     | 83.4           | 69.3            | 94.9           | 94.9            |
 | 300     | 94.9           | 85.9            | 94.9           | 94.9            |
+
+* Note: requires reverting the flash slow downs needed for overclocking. See
+"Customization" section below.
 
 The MDIO interface was changed from polled to interrupt driven, thus freeing
 up more processor time for packet processing.
@@ -63,6 +66,19 @@ iperf rate is acceptable, then sleep_us interval may be increased to 30.
 Core 0, of course, remains available for user applications.
 
 ## Customization
+
+To enable full speed operation when running at 150 MHz using flash, please
+comment out the last four lines of the top level CMakefile. When complete,
+should look like this:
+# Enable running with flash at higher system clock frequencies
+#pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
+#target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
+
+# Apply to all apps
+#pico_set_boot_stage2(pico_rmii_ethernet_lwiperf slower_boot2)
+#pico_set_boot_stage2(pico_rmii_ethernet_httpd slower_boot2)
+
+Without the above edit, iperf performance will be approximately 70.1 MBit/sec.
 
 Edit main.c in examples/{http, lwiperf} to set the pins used for the RMII
 interface, and set the target_clk variable to the desired system clock, one
